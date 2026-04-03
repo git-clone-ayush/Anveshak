@@ -33,6 +33,11 @@ namespace
   bool sensorHealthy = false;
   int32_t totalX = 0;
   int32_t totalY = 0;
+  float velocityX = 0.0f;
+  float velocityY = 0.0f;
+  float filteredVelocityX = 0.0f;
+  float filteredVelocityY = 0.0f;
+  const float velocityFilterAlpha = 0.25f;
 
   uint8_t readRegister(uint8_t reg);
   void writeRegister(uint8_t reg, uint8_t value);
@@ -89,6 +94,10 @@ namespace
     writeRegister(regMotionClear, 0xFF);
     totalX = 0;
     totalY = 0;
+    velocityX = 0.0f;
+    velocityY = 0.0f;
+    filteredVelocityX = 0.0f;
+    filteredVelocityY = 0.0f;
   }
 }
 
@@ -150,17 +159,18 @@ namespace OpticalFlowTest
       return;
     }
 
+    const unsigned long previousReadMs = lastReadMs;
     lastReadMs = millis();
 
     const uint8_t motion = readRegister(regMotion);
     const uint8_t squal = readRegister(regSqual);
-    const unsigned long now = millis();
+    const unsigned long now = lastReadMs;
 
     if (now - lastStatusMs >= 500)
     {
       lastStatusMs = now;
-      Serial.printf("alive product=0x%02X motion=0x%02X quality=%u totalX=%ld totalY=%ld\n",
-                    readRegister(regProductId), motion, squal, totalX, totalY);
+      Serial.printf("alive product=0x%02X motion=0x%02X quality=%u totalX=%ld totalY=%ld vx=%.2f vy=%.2f\n",
+                    readRegister(regProductId), motion, squal, totalX, totalY, filteredVelocityX, filteredVelocityY);
     }
 
     if (motion & overflowBit)
@@ -174,12 +184,18 @@ namespace OpticalFlowTest
     {
       const int8_t deltaX = static_cast<int8_t>(readRegister(regDeltaX));
       const int8_t deltaY = static_cast<int8_t>(readRegister(regDeltaY));
+      const float dtSeconds = (previousReadMs == 0) ? 0.02f : (now - previousReadMs) / 1000.0f;
 
       totalX += deltaX;
       totalY += deltaY;
+      velocityX = deltaX / dtSeconds;
+      velocityY = deltaY / dtSeconds;
+      filteredVelocityX += velocityFilterAlpha * (velocityX - filteredVelocityX);
+      filteredVelocityY += velocityFilterAlpha * (velocityY - filteredVelocityY);
 
       Serial.printf("dx=%d dy=%d quality=%u motion=0x%02X\n", deltaX, deltaY, squal, motion);
-      Serial.printf("totalX=%ld totalY=%ld\n", totalX, totalY);
+      Serial.printf("totalX=%ld totalY=%ld vx=%.2f vy=%.2f filtVx=%.2f filtVy=%.2f\n",
+                    totalX, totalY, velocityX, velocityY, filteredVelocityX, filteredVelocityY);
     }
   }
 }
