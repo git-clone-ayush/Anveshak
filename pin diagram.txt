@@ -1,0 +1,63 @@
+Anveshak Drone - ESP32 Pin Diagram
+==================================
+
+Controller:
+- Board: ESP32 Dev Module
+- Wi-Fi control: Web controller on ESP32 access point
+
+Motor / ESC Signal Connections
+------------------------------
+- Motor 1 ESC signal -> ESP32 GPIO 14
+  Position: Front Left
+
+- Motor 2 ESC signal -> ESP32 GPIO 27
+  Position: Front Right
+
+- Motor 3 ESC signal -> ESP32 GPIO 26
+  Position: Back Left
+
+- Motor 4 ESC signal -> ESP32 GPIO 25
+  Position: Back Right
+
+Common Connections
+------------------
+- All ESC GND -> ESP32 GND
+- Battery powers ESCs and motors
+- ESP32 should use a stable regulated supply
+- Keep all grounds common between ESP32 and ESCs
+
+Current Control Mapping
+-----------------------
+- Left joystick:
+  Throttle + Yaw
+
+- Right joystick:
+  Pitch + Roll
+
+Safety Functions
+----------------
+- ARM: Enables motor output only when throttle is at minimum
+- DISARM: Sets all controls to safe minimum
+- KILL SWITCH: Immediate motor cutoff, requires re-arm
+
+Quick ASCII Layout
+------------------
+
+           Front
+      [M1]     [M2]
+     GPIO14   GPIO27
+
+        ESP32 Dev Board
+
+     GPIO26   GPIO25
+      [M3]     [M4]
+            Back
+
+Notes
+-----
+- This file is based on the current code in src/main.cpp
+- No physical arm/disarm switch pin is defined yet
+- If you want, I can also make a cleaner wiring diagram for:
+  1. ESP32 + 4 ESC + battery
+  2. ESP32 + MPU6050 + ESCs
+  3. Full drone connection map
