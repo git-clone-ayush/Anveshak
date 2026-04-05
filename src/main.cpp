@@ -1,13 +1,12 @@
 #include <Arduino.h>
 
-#include "optical_flow_test.h"
+#include "acclgyr.h"
 
-void setup()
-{
-  OpticalFlowTest::begin();
+void setup() {
+  AcclGyr::begin();
 }
 
-void loop()
-{
-  OpticalFlowTest::loop();
+void loop() {
+  AcclGyr::loop();
 }
+

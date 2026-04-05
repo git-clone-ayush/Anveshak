@@ -1,12 +1,29 @@
-Anveshak Drone - ESP32 Pin Diagram
-==================================
+Anveshak Drone - ESP32 Full Pin Diagram
+=======================================
 
-Controller:
+Controller
+----------
 - Board: ESP32 Dev Module
-- Wi-Fi control: Web controller on ESP32 access point
+- Wi-Fi control: ESP32 SoftAP web controller in `src/drone_controller.cpp`
+- Current `src/main.cpp` entrypoint: MPU6050 / accel+gyro test via `src/acclgyr.cpp`
 
-Motor / ESC Signal Connections
-------------------------------
+ESP32 Pin Summary
+-----------------
+- GPIO 5  -> ADNS3080 CS / NCS
+- GPIO 12 -> ADNS3080 RESET
+- GPIO 13 -> ADNS3080 NPD
+- GPIO 14 -> ESC Motor 1 signal (Front Left)
+- GPIO 18 -> ADNS3080 SCK
+- GPIO 19 -> ADNS3080 MISO
+- GPIO 21 -> MPU6050 SDA
+- GPIO 22 -> MPU6050 SCL
+- GPIO 23 -> ADNS3080 MOSI
+- GPIO 25 -> ESC Motor 4 signal (Back Right)
+- GPIO 26 -> ESC Motor 3 signal (Back Left)
+- GPIO 27 -> ESC Motor 2 signal (Front Right)
+
+Motor / ESC Connections
+-----------------------
 - Motor 1 ESC signal -> ESP32 GPIO 14
   Position: Front Left
 
@@ -19,15 +36,60 @@ Motor / ESC Signal Connections
 - Motor 4 ESC signal -> ESP32 GPIO 25
   Position: Back Right
 
-Common Connections
-------------------
-- All ESC GND -> ESP32 GND
-- Battery powers ESCs and motors
-- ESP32 should use a stable regulated supply
-- Keep all grounds common between ESP32 and ESCs
+- All ESC grounds -> ESP32 GND
+- ESC power comes from flight battery / power distribution
+- ESP32 must be powered from a stable regulated supply
 
-Current Control Mapping
+MPU6050 / ITG-AccelGyro Connections
+-----------------------------------
+- MPU6050 VCC -> ESP32 3.3V
+- MPU6050 GND -> ESP32 GND
+- MPU6050 SDA -> ESP32 GPIO 21
+- MPU6050 SCL -> ESP32 GPIO 22
+- MPU6050 AD0 -> GND for I2C address `0x68`
+  Or AD0 -> 3.3V for I2C address `0x69`
+- MPU6050 INT -> not used in current code
+
+Optical Flow Sensor Connections
+-------------------------------
+Based on `src/optical_flow_test.cpp`
+
+- ADNS3080 VDD / VDDIO -> ESP32 3.3V
+- ADNS3080 GND -> ESP32 GND
+- ADNS3080 NCS / CS -> ESP32 GPIO 5
+- ADNS3080 SCK -> ESP32 GPIO 18
+- ADNS3080 MISO -> ESP32 GPIO 19
+- ADNS3080 MOSI / SDIO -> ESP32 GPIO 23
+- ADNS3080 RESET -> ESP32 GPIO 12
+- ADNS3080 NPD -> ESP32 GPIO 13
+
+Important shared wiring
 -----------------------
+- Common ground is mandatory:
+  Battery ground, ESP32 ground, ESC grounds, MPU6050 ground, and ADNS3080 ground must all be connected together
+- Use 3.3V logic for MPU6050 and ADNS3080 connections
+- The optical flow sensor also needs its correct lens and illumination setup for reliable tracking
+
+Software Modules And Their Pins
+-------------------------------
+- `src/main.cpp`
+  Calls `AcclGyr::begin()` and `AcclGyr::loop()`
+
+- `src/acclgyr.cpp`
+  Uses I2C on GPIO 21 and GPIO 22
+
+- `src/optical_flow_test.cpp`
+  Uses SPI on GPIO 5, 18, 19, 23 plus RESET on GPIO 12 and NPD on GPIO 13
+
+- `src/drone_controller.cpp`
+  Uses PWM motor outputs on GPIO 14, 27, 26, 25
+
+- `src/filter.cpp` and `src/pid_controller.cpp`
+  No direct hardware pins
+  Pure software modules for sensor fusion and control
+
+Control Mapping
+---------------
 - Left joystick:
   Throttle + Yaw
 
@@ -47,7 +109,13 @@ Quick ASCII Layout
       [M1]     [M2]
      GPIO14   GPIO27
 
+   Flow Sensor SPI Bus
+   CS=5  SCK=18  MISO=19  MOSI=23
+   RESET=12  NPD=13
+
         ESP32 Dev Board
+      SDA=21   SCL=22
+        MPU6050 / ITG
 
      GPIO26   GPIO25
       [M3]     [M4]
@@ -55,9 +123,6 @@ Quick ASCII Layout
 
 Notes
 -----
-- This file is based on the current code in src/main.cpp
-- No physical arm/disarm switch pin is defined yet
-- If you want, I can also make a cleaner wiring diagram for:
-  1. ESP32 + 4 ESC + battery
-  2. ESP32 + MPU6050 + ESCs
-  3. Full drone connection map
+- No barometer, ultrasonic, or ToF height sensor is defined yet
+- PID and filter files do not add new wiring by themselves
+- For true stable hover altitude, an additional height sensor is still recommended
