@@ -38,6 +38,8 @@ namespace
   float filteredVelocityX = 0.0f;
   float filteredVelocityY = 0.0f;
   const float velocityFilterAlpha = 0.25f;
+  const uint8_t minUsableSqual = 8;
+  OpticalFlowTest::Sample latestFlowSample;
 
   uint8_t readRegister(uint8_t reg);
   void writeRegister(uint8_t reg, uint8_t value);
@@ -98,6 +100,10 @@ namespace
     velocityY = 0.0f;
     filteredVelocityX = 0.0f;
     filteredVelocityY = 0.0f;
+    latestFlowSample.flow.velocityX = 0.0f;
+    latestFlowSample.flow.velocityY = 0.0f;
+    latestFlowSample.flow.quality = 0.0f;
+    latestFlowSample.flow.valid = false;
   }
 }
 
@@ -142,15 +148,12 @@ namespace OpticalFlowTest
     Serial.printf("Config bits: 0x%02X\n", readRegister(regConfigurationBits));
     Serial.println("ADNS3080 detected");
     Serial.println("Resolution set to 400 CPI");
-    Serial.println("Move the sensor over a textured surface in good light.");
-    Serial.println("Output: dx dy totalX totalY quality");
   }
 
   void loop()
   {
     if (!sensorHealthy)
     {
-      delay(250);
       return;
     }
 
@@ -166,21 +169,15 @@ namespace OpticalFlowTest
     const uint8_t squal = readRegister(regSqual);
     const unsigned long now = lastReadMs;
 
-    if (now - lastStatusMs >= 500)
-    {
-      lastStatusMs = now;
-      Serial.printf("alive product=0x%02X motion=0x%02X quality=%u totalX=%ld totalY=%ld vx=%.2f vy=%.2f\n",
-                    readRegister(regProductId), motion, squal, totalX, totalY, filteredVelocityX, filteredVelocityY);
-    }
-
     if (motion & overflowBit)
     {
-      Serial.println("Overflow detected: motion too fast for reliable reading");
       clearMotion();
+      latestFlowSample.timestampMs = now;
+      latestFlowSample.healthy = false;
       return;
     }
 
-    if (motion & motionBit)
+    if ((motion & motionBit) && squal >= minUsableSqual)
     {
       const int8_t deltaX = static_cast<int8_t>(readRegister(regDeltaX));
       const int8_t deltaY = static_cast<int8_t>(readRegister(regDeltaY));
@@ -192,10 +189,49 @@ namespace OpticalFlowTest
       velocityY = deltaY / dtSeconds;
       filteredVelocityX += velocityFilterAlpha * (velocityX - filteredVelocityX);
       filteredVelocityY += velocityFilterAlpha * (velocityY - filteredVelocityY);
-
-      Serial.printf("dx=%d dy=%d quality=%u motion=0x%02X\n", deltaX, deltaY, squal, motion);
-      Serial.printf("totalX=%ld totalY=%ld vx=%.2f vy=%.2f filtVx=%.2f filtVy=%.2f\n",
-                    totalX, totalY, velocityX, velocityY, filteredVelocityX, filteredVelocityY);
     }
+    else if (squal >= minUsableSqual)
+    {
+      velocityX = 0.0f;
+      velocityY = 0.0f;
+      filteredVelocityX += velocityFilterAlpha * (velocityX - filteredVelocityX);
+      filteredVelocityY += velocityFilterAlpha * (velocityY - filteredVelocityY);
+    }
+    else
+    {
+      filteredVelocityX = 0.0f;
+      filteredVelocityY = 0.0f;
+    }
+
+    latestFlowSample.flow.velocityX = filteredVelocityX;
+    latestFlowSample.flow.velocityY = filteredVelocityY;
+    latestFlowSample.flow.quality = static_cast<float>(squal);
+    latestFlowSample.flow.valid = (squal >= minUsableSqual);
+    latestFlowSample.totalX = totalX;
+    latestFlowSample.totalY = totalY;
+    latestFlowSample.timestampMs = now;
+    latestFlowSample.healthy = latestFlowSample.flow.valid;
+
+    if (now - lastStatusMs >= 1000)
+    {
+      lastStatusMs = now;
+      Serial.printf("flow quality=%u valid=%s vx=%.2f vy=%.2f totalX=%ld totalY=%ld\n",
+                    squal,
+                    latestFlowSample.flow.valid ? "yes" : "no",
+                    latestFlowSample.flow.velocityX,
+                    latestFlowSample.flow.velocityY,
+                    totalX,
+                    totalY);
+    }
+  }
+
+  bool isHealthy()
+  {
+    return sensorHealthy && latestFlowSample.healthy;
+  }
+
+  Sample latestSample()
+  {
+    return latestFlowSample;
   }
 }

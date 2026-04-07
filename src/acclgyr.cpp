@@ -12,10 +12,22 @@ namespace
 
   constexpr int sdaPin = 21;
   constexpr int sclPin = 22;
-  constexpr unsigned long sampleIntervalMs = 1000;
+  constexpr unsigned long sampleIntervalMs = 5;
+  constexpr float accelScaleLsbPerG = 16384.0f;
+  constexpr float gyroScaleLsbPerDegPerSec = 131.0f;
+  constexpr int calibrationSampleCount = 300;
 
   bool sensorReady = false;
+  bool calibrationComplete = false;
   unsigned long lastSampleMs = 0;
+  float gyroBiasX = 0.0f;
+  float gyroBiasY = 0.0f;
+  float gyroBiasZ = 0.0f;
+  long gyroBiasSumX = 0;
+  long gyroBiasSumY = 0;
+  long gyroBiasSumZ = 0;
+  int biasSamplesCollected = 0;
+  AcclGyr::Sample latestImuSample;
 
   bool writeRegister(uint8_t reg, uint8_t value)
   {
@@ -96,20 +108,19 @@ namespace AcclGyr
     delay(100);
     sensorReady = true;
     Serial.println("MPU6050 ready");
+    Serial.println("Keep the drone still for gyro bias calibration...");
   }
 
   void loop()
   {
     if (!sensorReady)
     {
-      delay(250);
       return;
     }
 
     const unsigned long now = millis();
     if (now - lastSampleMs < sampleIntervalMs)
     {
-      delay(5);
       return;
     }
 
@@ -130,15 +141,44 @@ namespace AcclGyr
     const int16_t gyroY = toInt16(rawData[10], rawData[11]);
     const int16_t gyroZ = toInt16(rawData[12], rawData[13]);
 
-    const float temperatureC = (temperatureRaw / 340.0f) + 36.53f;
+    if (!calibrationComplete)
+    {
+      gyroBiasSumX += gyroX;
+      gyroBiasSumY += gyroY;
+      gyroBiasSumZ += gyroZ;
+      biasSamplesCollected++;
 
-    Serial.printf("accelX=%d accelY=%d accelZ=%d tempC=%.2f gyroX=%d gyroY=%d gyroZ=%d\n",
-                  accelerometerX,
-                  accelerometerY,
-                  accelerometerZ,
-                  temperatureC,
-                  gyroX,
-                  gyroY,
-                  gyroZ);
+      if (biasSamplesCollected >= calibrationSampleCount)
+      {
+        gyroBiasX = static_cast<float>(gyroBiasSumX) / static_cast<float>(biasSamplesCollected);
+        gyroBiasY = static_cast<float>(gyroBiasSumY) / static_cast<float>(biasSamplesCollected);
+        gyroBiasZ = static_cast<float>(gyroBiasSumZ) / static_cast<float>(biasSamplesCollected);
+        calibrationComplete = true;
+        Serial.printf("MPU6050 gyro bias calibrated gx=%.2f gy=%.2f gz=%.2f\n",
+                      gyroBiasX, gyroBiasY, gyroBiasZ);
+      }
+
+      return;
+    }
+
+    latestImuSample.imu.accelX = static_cast<float>(accelerometerX) / accelScaleLsbPerG;
+    latestImuSample.imu.accelY = static_cast<float>(accelerometerY) / accelScaleLsbPerG;
+    latestImuSample.imu.accelZ = static_cast<float>(accelerometerZ) / accelScaleLsbPerG;
+    latestImuSample.imu.gyroXDegPerSec = (static_cast<float>(gyroX) - gyroBiasX) / gyroScaleLsbPerDegPerSec;
+    latestImuSample.imu.gyroYDegPerSec = (static_cast<float>(gyroY) - gyroBiasY) / gyroScaleLsbPerDegPerSec;
+    latestImuSample.imu.gyroZDegPerSec = (static_cast<float>(gyroZ) - gyroBiasZ) / gyroScaleLsbPerDegPerSec;
+    latestImuSample.temperatureC = (temperatureRaw / 340.0f) + 36.53f;
+    latestImuSample.timestampMs = now;
+    latestImuSample.valid = true;
+  }
+
+  bool isReady()
+  {
+    return sensorReady && calibrationComplete && latestImuSample.valid;
+  }
+
+  Sample latestSample()
+  {
+    return latestImuSample;
   }
 }

@@ -39,7 +39,7 @@ namespace PidController
     HoverTargets()
       : rollDeg(0.0f), pitchDeg(0.0f), yawRateDegPerSec(0.0f),
         velocityX(0.0f), velocityY(0.0f),
-        takeoffThrottle(1180.0f), takeoffEnabled(false)
+        baseThrottleUs(1000.0f), takeoffThrottle(1180.0f), takeoffEnabled(false)
     {
     }
 
@@ -48,6 +48,7 @@ namespace PidController
     float yawRateDegPerSec;
     float velocityX;
     float velocityY;
+    float baseThrottleUs;
     float takeoffThrottle;
     bool takeoffEnabled;
   };

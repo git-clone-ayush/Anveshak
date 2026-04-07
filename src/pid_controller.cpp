@@ -134,7 +134,7 @@ namespace PidController
     }
     else
     {
-      currentThrottleUs_ = hoverThrottleUs_;
+      currentThrottleUs_ = clampValue(targets.baseThrottleUs, idleThrottleUs_, 2000.0f);
     }
 
     float desiredRollDeg = targets.rollDeg;

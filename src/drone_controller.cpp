@@ -1,8 +1,13 @@
 #include <Arduino.h>
+#include <Preferences.h>
 #include <WiFi.h>
 #include <WebServer.h>
 
+#include "acclgyr.h"
 #include "drone_controller.h"
+#include "filter.h"
+#include "optical_flow_test.h"
+#include "pid_controller.h"
 
 namespace
 {
@@ -10,12 +15,28 @@ namespace
   const char* password = "12345678";
 
   WebServer server(80);
+  Preferences preferences;
+  PidController::HoverPid hoverPid;
+  Filter::HoverStateFilter hoverStateFilter;
+  Filter::HoverEstimate hoverEstimate;
+  bool hoverEstimateValid = false;
 
   int escPins[4] = {14, 27, 26, 25};
   int pwmChannel[4] = {0, 1, 2, 3};
 
   const int pwmFreq = 50;
   const int pwmResolution = 16;
+  const unsigned long controlTimeoutMs = 750;
+  const unsigned long stabilizationLoopIntervalMs = 20;
+  const float maxStickAngleDeg = 10.0f;
+  const float maxStickVelocity = 140.0f;
+  const float maxYawRateDegPerSec = 120.0f;
+  const int stickDeadband = 12;
+  const float opticalFlowForwardFromSensorY = -1.0f;
+  const float opticalFlowRightFromSensorX = 1.0f;
+  const float imuRollToControllerSign = 1.0f;
+  const float imuPitchToControllerSign = -1.0f;
+  const float imuYawRateToControllerSign = 1.0f;
 
   int throttle = 1000;
   int pitch = 0;
@@ -23,12 +44,205 @@ namespace
   int yaw = 0;
   bool isArmed = false;
   bool killSwitchActive = false;
+  bool failsafeTriggered = false;
+  unsigned long lastControlMs = 0;
+  unsigned long lastStabilizationLoopMs = 0;
 
   int motorSpeed[4];
+
+  struct StoredPidSettings
+  {
+    PidController::Gains rollPitch;
+    PidController::Gains yaw;
+    PidController::Gains velocity;
+    float idleThrottleUs;
+    float hoverThrottleUs;
+    float takeoffRampRateUsPerSec;
+    float takeoffThrottleUs;
+  };
+
+  float clampFloat(float value, float minimum, float maximum)
+  {
+    if (value < minimum)
+    {
+      return minimum;
+    }
+
+    if (value > maximum)
+    {
+      return maximum;
+    }
+
+    return value;
+  }
+
+  PidController::Gains makeGains(float kp, float ki, float kd,
+                                 float integratorMin, float integratorMax,
+                                 float outputMin, float outputMax)
+  {
+    PidController::Gains gains;
+    gains.kp = kp;
+    gains.ki = ki;
+    gains.kd = kd;
+    gains.integratorMin = integratorMin;
+    gains.integratorMax = integratorMax;
+    gains.outputMin = outputMin;
+    gains.outputMax = outputMax;
+    return gains;
+  }
+
+  StoredPidSettings makeDefaultPidSettings()
+  {
+    StoredPidSettings defaults;
+    defaults.rollPitch = makeGains(4.5f, 0.2f, 0.15f, -50.0f, 50.0f, -250.0f, 250.0f);
+    defaults.yaw = makeGains(1.8f, 0.05f, 0.02f, -30.0f, 30.0f, -120.0f, 120.0f);
+    defaults.velocity = makeGains(0.12f, 0.02f, 0.01f, -5.0f, 5.0f, -8.0f, 8.0f);
+    defaults.idleThrottleUs = 1000.0f;
+    defaults.hoverThrottleUs = 1180.0f;
+    defaults.takeoffRampRateUsPerSec = 140.0f;
+    defaults.takeoffThrottleUs = 1180.0f;
+    return defaults;
+  }
+
+  StoredPidSettings pidSettings = makeDefaultPidSettings();
+
+  void applyPidSettings()
+  {
+    hoverPid.configureRateGains(pidSettings.rollPitch, pidSettings.yaw);
+    hoverPid.configureVelocityGains(pidSettings.velocity);
+    hoverPid.configureTakeoff(pidSettings.idleThrottleUs,
+                              pidSettings.hoverThrottleUs,
+                              pidSettings.takeoffRampRateUsPerSec);
+  }
+
+  void loadPidSettings()
+  {
+    const StoredPidSettings defaults = makeDefaultPidSettings();
+    pidSettings = defaults;
+
+    if (!preferences.begin("drone-pid", true))
+    {
+      applyPidSettings();
+      return;
+    }
+
+    pidSettings.rollPitch.kp = preferences.getFloat("rpkp", defaults.rollPitch.kp);
+    pidSettings.rollPitch.ki = preferences.getFloat("rpki", defaults.rollPitch.ki);
+    pidSettings.rollPitch.kd = preferences.getFloat("rpkd", defaults.rollPitch.kd);
+    pidSettings.yaw.kp = preferences.getFloat("ykp", defaults.yaw.kp);
+    pidSettings.yaw.ki = preferences.getFloat("yki", defaults.yaw.ki);
+    pidSettings.yaw.kd = preferences.getFloat("ykd", defaults.yaw.kd);
+    pidSettings.velocity.kp = preferences.getFloat("vkp", defaults.velocity.kp);
+    pidSettings.velocity.ki = preferences.getFloat("vki", defaults.velocity.ki);
+    pidSettings.velocity.kd = preferences.getFloat("vkd", defaults.velocity.kd);
+    pidSettings.idleThrottleUs = preferences.getFloat("idle", defaults.idleThrottleUs);
+    pidSettings.hoverThrottleUs = preferences.getFloat("hover", defaults.hoverThrottleUs);
+    pidSettings.takeoffRampRateUsPerSec = preferences.getFloat("ramp", defaults.takeoffRampRateUsPerSec);
+    pidSettings.takeoffThrottleUs = preferences.getFloat("takeoff", defaults.takeoffThrottleUs);
+
+    preferences.end();
+
+    pidSettings.rollPitch.kp = clampFloat(pidSettings.rollPitch.kp, 0.0f, 50.0f);
+    pidSettings.rollPitch.ki = clampFloat(pidSettings.rollPitch.ki, 0.0f, 10.0f);
+    pidSettings.rollPitch.kd = clampFloat(pidSettings.rollPitch.kd, 0.0f, 10.0f);
+    pidSettings.yaw.kp = clampFloat(pidSettings.yaw.kp, 0.0f, 20.0f);
+    pidSettings.yaw.ki = clampFloat(pidSettings.yaw.ki, 0.0f, 10.0f);
+    pidSettings.yaw.kd = clampFloat(pidSettings.yaw.kd, 0.0f, 10.0f);
+    pidSettings.velocity.kp = clampFloat(pidSettings.velocity.kp, 0.0f, 10.0f);
+    pidSettings.velocity.ki = clampFloat(pidSettings.velocity.ki, 0.0f, 10.0f);
+    pidSettings.velocity.kd = clampFloat(pidSettings.velocity.kd, 0.0f, 10.0f);
+    pidSettings.idleThrottleUs = clampFloat(pidSettings.idleThrottleUs, 1000.0f, 1400.0f);
+    pidSettings.hoverThrottleUs = clampFloat(pidSettings.hoverThrottleUs, pidSettings.idleThrottleUs, 2000.0f);
+    pidSettings.takeoffThrottleUs = clampFloat(pidSettings.takeoffThrottleUs, pidSettings.idleThrottleUs, 2000.0f);
+    pidSettings.takeoffRampRateUsPerSec = clampFloat(pidSettings.takeoffRampRateUsPerSec, 1.0f, 1000.0f);
+
+    applyPidSettings();
+  }
+
+  bool savePidSettings()
+  {
+    if (!preferences.begin("drone-pid", false))
+    {
+      return false;
+    }
+
+    preferences.putFloat("rpkp", pidSettings.rollPitch.kp);
+    preferences.putFloat("rpki", pidSettings.rollPitch.ki);
+    preferences.putFloat("rpkd", pidSettings.rollPitch.kd);
+    preferences.putFloat("ykp", pidSettings.yaw.kp);
+    preferences.putFloat("yki", pidSettings.yaw.ki);
+    preferences.putFloat("ykd", pidSettings.yaw.kd);
+    preferences.putFloat("vkp", pidSettings.velocity.kp);
+    preferences.putFloat("vki", pidSettings.velocity.ki);
+    preferences.putFloat("vkd", pidSettings.velocity.kd);
+    preferences.putFloat("idle", pidSettings.idleThrottleUs);
+    preferences.putFloat("hover", pidSettings.hoverThrottleUs);
+    preferences.putFloat("ramp", pidSettings.takeoffRampRateUsPerSec);
+    preferences.putFloat("takeoff", pidSettings.takeoffThrottleUs);
+    preferences.end();
+    return true;
+  }
+
+  float argToFloat(const char* name, float fallback)
+  {
+    if (!server.hasArg(name))
+    {
+      return fallback;
+    }
+
+    return server.arg(name).toFloat();
+  }
+
+  String pidSettingsJson()
+  {
+    String json = "{";
+    json += "\"rollPitchKp\":" + String(pidSettings.rollPitch.kp, 4) + ",";
+    json += "\"rollPitchKi\":" + String(pidSettings.rollPitch.ki, 4) + ",";
+    json += "\"rollPitchKd\":" + String(pidSettings.rollPitch.kd, 4) + ",";
+    json += "\"yawKp\":" + String(pidSettings.yaw.kp, 4) + ",";
+    json += "\"yawKi\":" + String(pidSettings.yaw.ki, 4) + ",";
+    json += "\"yawKd\":" + String(pidSettings.yaw.kd, 4) + ",";
+    json += "\"velocityKp\":" + String(pidSettings.velocity.kp, 4) + ",";
+    json += "\"velocityKi\":" + String(pidSettings.velocity.ki, 4) + ",";
+    json += "\"velocityKd\":" + String(pidSettings.velocity.kd, 4) + ",";
+    json += "\"idleThrottleUs\":" + String(pidSettings.idleThrottleUs, 2) + ",";
+    json += "\"hoverThrottleUs\":" + String(pidSettings.hoverThrottleUs, 2) + ",";
+    json += "\"takeoffRampRateUsPerSec\":" + String(pidSettings.takeoffRampRateUsPerSec, 2) + ",";
+    json += "\"takeoffThrottleUs\":" + String(pidSettings.takeoffThrottleUs, 2) + ",";
+    json += "\"armed\":" + String(isArmed ? "true" : "false") + ",";
+    json += "\"killSwitchActive\":" + String(killSwitchActive ? "true" : "false") + ",";
+    json += "\"failsafeTriggered\":" + String(failsafeTriggered ? "true" : "false");
+    json += "}";
+    return json;
+  }
+
+  float normalizedStick(int value)
+  {
+    if (abs(value) <= stickDeadband)
+    {
+      return 0.0f;
+    }
+
+    return clampFloat(static_cast<float>(value) / 300.0f, -1.0f, 1.0f);
+  }
 
   uint32_t usToDuty(int us)
   {
     return (us * 65535) / 20000;
+  }
+
+  void mixMotors(int baseThrottleUs, int pitchCommand, int rollCommand, int yawCommand)
+  {
+    motorSpeed[0] = baseThrottleUs - pitchCommand - rollCommand - yawCommand;
+    motorSpeed[1] = baseThrottleUs - pitchCommand + rollCommand + yawCommand;
+    motorSpeed[2] = baseThrottleUs + pitchCommand - rollCommand + yawCommand;
+    motorSpeed[3] = baseThrottleUs + pitchCommand + rollCommand - yawCommand;
+
+    for (int i = 0; i < 4; i++)
+    {
+      motorSpeed[i] = constrain(motorSpeed[i], 1000, 2000);
+      ledcWrite(pwmChannel[i], usToDuty(motorSpeed[i]));
+    }
   }
 
   void writeAllMotors(int pulseUs)
@@ -52,12 +266,17 @@ namespace
   {
     isArmed = false;
     resetControls();
+    hoverPid.reset();
+    hoverStateFilter.reset();
+    hoverEstimateValid = false;
+    lastStabilizationLoopMs = 0;
     writeAllMotors(1000);
   }
 
   void killMotors()
   {
     killSwitchActive = true;
+    lastControlMs = 0;
     disarmMotors();
   }
 
@@ -69,6 +288,12 @@ namespace
     }
 
     killSwitchActive = false;
+    failsafeTriggered = false;
+    lastControlMs = millis();
+    hoverPid.reset();
+    hoverStateFilter.reset();
+    hoverEstimateValid = false;
+    lastStabilizationLoopMs = 0;
     isArmed = true;
     writeAllMotors(1000);
     return true;
@@ -82,16 +307,63 @@ namespace
       return;
     }
 
-    motorSpeed[0] = throttle - pitch - roll - yaw;
-    motorSpeed[1] = throttle - pitch + roll + yaw;
-    motorSpeed[2] = throttle + pitch - roll + yaw;
-    motorSpeed[3] = throttle + pitch + roll - yaw;
+    mixMotors(throttle, pitch, roll, yaw);
+  }
 
-    for (int i = 0; i < 4; i++)
+  void runStabilizedControlLoop()
+  {
+    if (!isArmed || killSwitchActive)
     {
-      motorSpeed[i] = constrain(motorSpeed[i], 1000, 2000);
-      ledcWrite(pwmChannel[i], usToDuty(motorSpeed[i]));
+      return;
     }
+
+    const unsigned long now = millis();
+    if (lastStabilizationLoopMs != 0 && (now - lastStabilizationLoopMs) < stabilizationLoopIntervalMs)
+    {
+      return;
+    }
+
+    const float dtSeconds = (lastStabilizationLoopMs == 0)
+      ? (static_cast<float>(stabilizationLoopIntervalMs) / 1000.0f)
+      : (static_cast<float>(now - lastStabilizationLoopMs) / 1000.0f);
+    lastStabilizationLoopMs = now;
+
+    const AcclGyr::Sample imuSample = AcclGyr::latestSample();
+    if (!imuSample.valid)
+    {
+      updateMotors();
+      return;
+    }
+
+    const OpticalFlowTest::Sample rawFlowSample = OpticalFlowTest::latestSample();
+    Filter::OpticalFlowSample mappedFlowSample;
+    mappedFlowSample.valid = rawFlowSample.flow.valid;
+    mappedFlowSample.quality = rawFlowSample.flow.quality;
+    mappedFlowSample.velocityX = rawFlowSample.flow.velocityY * opticalFlowForwardFromSensorY;
+    mappedFlowSample.velocityY = rawFlowSample.flow.velocityX * opticalFlowRightFromSensorX;
+
+    hoverEstimate = hoverStateFilter.update(imuSample.imu, mappedFlowSample, dtSeconds);
+    hoverEstimate.attitude.rollDeg *= imuRollToControllerSign;
+    hoverEstimate.attitude.pitchDeg *= imuPitchToControllerSign;
+    hoverEstimate.attitude.yawRateDegPerSec *= imuYawRateToControllerSign;
+    hoverEstimateValid = true;
+
+    PidController::HoverTargets targets;
+    targets.rollDeg = normalizedStick(roll) * maxStickAngleDeg;
+    targets.pitchDeg = normalizedStick(pitch) * maxStickAngleDeg;
+    targets.yawRateDegPerSec = normalizedStick(yaw) * maxYawRateDegPerSec;
+    targets.velocityX = normalizedStick(pitch) * maxStickVelocity;
+    targets.velocityY = normalizedStick(roll) * maxStickVelocity;
+    targets.baseThrottleUs = static_cast<float>(throttle);
+    targets.takeoffThrottle = pidSettings.takeoffThrottleUs;
+    targets.takeoffEnabled = false;
+
+    const PidController::HoverOutput output = hoverPid.update(targets, hoverEstimate, dtSeconds);
+
+    mixMotors(static_cast<int>(output.throttleUs),
+              static_cast<int>(output.pitchCorrection),
+              static_cast<int>(output.rollCorrection),
+              static_cast<int>(output.yawCorrection));
   }
 
   String webpage()
@@ -110,6 +382,9 @@ namespace
       --arm: #15803d;
       --disarm: #475569;
       --kill: #b91c1c;
+      --apply: #0369a1;
+      --save: #0f766e;
+      --reload: #475569;
     }
 
     * {
@@ -125,8 +400,8 @@ namespace
         radial-gradient(circle at top, rgba(56, 189, 248, 0.18), transparent 28%),
         linear-gradient(180deg, #020617 0%, #0f172a 100%);
       color: var(--text);
-      touch-action: none;
-      overflow: hidden;
+      overflow-x: hidden;
+      overflow-y: auto;
     }
 
     .layout {
@@ -139,7 +414,8 @@ namespace
 
     .topbar,
     .value-panel,
-    .joystick-card {
+    .joystick-card,
+    .tuning-card {
       background: rgba(15, 23, 42, 0.86);
       border: 1px solid var(--panel-border);
       border-radius: 18px;
@@ -184,6 +460,9 @@ namespace
     .arm-btn { background: var(--arm); }
     .disarm-btn { background: var(--disarm); }
     .kill-btn { background: var(--kill); }
+    .apply-btn { background: var(--apply); }
+    .save-btn { background: var(--save); }
+    .reload-btn { background: var(--reload); }
 
     .value-panel {
       display: grid;
@@ -296,6 +575,96 @@ namespace
       text-align: center;
       line-height: 1.4;
     }
+
+    .tuning-card {
+      padding: 14px;
+    }
+
+    .tuning-title {
+      font-size: 14px;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 1px;
+      margin-bottom: 10px;
+    }
+
+    .tuning-note,
+    .pid-status {
+      font-size: 12px;
+      color: var(--muted);
+      line-height: 1.4;
+    }
+
+    .pid-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 12px;
+      margin-top: 12px;
+    }
+
+    .pid-group {
+      padding: 12px;
+      border-radius: 14px;
+      background: rgba(2, 6, 23, 0.35);
+      border: 1px solid rgba(148, 163, 184, 0.15);
+    }
+
+    .pid-group-title {
+      font-size: 13px;
+      margin-bottom: 10px;
+      color: #f8fafc;
+    }
+
+    .field-grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 8px;
+    }
+
+    .field-grid.two {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+
+    .field {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+
+    .field label {
+      font-size: 11px;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.6px;
+    }
+
+    .field input {
+      width: 100%;
+      border-radius: 10px;
+      border: 1px solid rgba(148, 163, 184, 0.2);
+      background: rgba(15, 23, 42, 0.95);
+      color: var(--text);
+      padding: 10px;
+      font-size: 14px;
+    }
+
+    .pid-actions {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 10px;
+      margin-top: 14px;
+    }
+
+    @media (max-width: 820px) {
+      .sticks,
+      .pid-grid,
+      .field-grid,
+      .field-grid.two,
+      .pid-actions,
+      .button-row {
+        grid-template-columns: 1fr;
+      }
+    }
   </style>
 </head>
 <body>
@@ -345,6 +714,96 @@ namespace
         </div>
         <div class="hint">Pitch and roll return to center when released.</div>
       </div>
+    </div>
+
+    <div class="tuning-card">
+      <div class="tuning-title">PID And Takeoff Tuning</div>
+      <div class="tuning-note">Assumed frame setup: optical flow sensor facing downward, MPU X-axis facing forward. Roll tuning is left/right stabilization. Pitch tuning is forward/back stabilization. Verify axis signs with props removed before flight.</div>
+
+      <div class="pid-grid">
+        <div class="pid-group">
+          <div class="pid-group-title">Roll / Pitch</div>
+          <div class="field-grid">
+            <div class="field">
+              <label for="rollPitchKp">KP</label>
+              <input id="rollPitchKp" type="number" step="0.01">
+            </div>
+            <div class="field">
+              <label for="rollPitchKi">KI</label>
+              <input id="rollPitchKi" type="number" step="0.01">
+            </div>
+            <div class="field">
+              <label for="rollPitchKd">KD</label>
+              <input id="rollPitchKd" type="number" step="0.01">
+            </div>
+          </div>
+        </div>
+
+        <div class="pid-group">
+          <div class="pid-group-title">Yaw</div>
+          <div class="field-grid">
+            <div class="field">
+              <label for="yawKp">KP</label>
+              <input id="yawKp" type="number" step="0.01">
+            </div>
+            <div class="field">
+              <label for="yawKi">KI</label>
+              <input id="yawKi" type="number" step="0.01">
+            </div>
+            <div class="field">
+              <label for="yawKd">KD</label>
+              <input id="yawKd" type="number" step="0.01">
+            </div>
+          </div>
+        </div>
+
+        <div class="pid-group">
+          <div class="pid-group-title">Optical Flow Velocity</div>
+          <div class="field-grid">
+            <div class="field">
+              <label for="velocityKp">KP</label>
+              <input id="velocityKp" type="number" step="0.01">
+            </div>
+            <div class="field">
+              <label for="velocityKi">KI</label>
+              <input id="velocityKi" type="number" step="0.01">
+            </div>
+            <div class="field">
+              <label for="velocityKd">KD</label>
+              <input id="velocityKd" type="number" step="0.01">
+            </div>
+          </div>
+        </div>
+
+        <div class="pid-group">
+          <div class="pid-group-title">Throttle / Takeoff</div>
+          <div class="field-grid two">
+            <div class="field">
+              <label for="idleThrottleUs">Idle (us)</label>
+              <input id="idleThrottleUs" type="number" step="1">
+            </div>
+            <div class="field">
+              <label for="hoverThrottleUs">Hover (us)</label>
+              <input id="hoverThrottleUs" type="number" step="1">
+            </div>
+            <div class="field">
+              <label for="takeoffRampRateUsPerSec">Ramp (us/s)</label>
+              <input id="takeoffRampRateUsPerSec" type="number" step="1">
+            </div>
+            <div class="field">
+              <label for="takeoffThrottleUs">Takeoff Target (us)</label>
+              <input id="takeoffThrottleUs" type="number" step="1">
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="pid-actions">
+        <button class="apply-btn" onclick="applyPidTuning()">APPLY</button>
+        <button class="save-btn" onclick="savePidTuning()">SAVE</button>
+        <button class="reload-btn" onclick="loadPidTuning(true)">RELOAD</button>
+      </div>
+      <div class="pid-status" id="pidStatus">Stored values load automatically on boot.</div>
     </div>
   </div>
 
@@ -424,6 +883,94 @@ namespace
 
     function setStatus(text) {
       document.getElementById('status').innerText = text;
+    }
+
+    function setPidStatus(text) {
+      document.getElementById('pidStatus').innerText = text;
+    }
+
+    function inputValue(id) {
+      return Number(document.getElementById(id).value);
+    }
+
+    function setInputValue(id, value, decimals) {
+      document.getElementById(id).value = Number(value).toFixed(decimals);
+    }
+
+    function populatePidForm(data) {
+      setInputValue('rollPitchKp', data.rollPitchKp, 3);
+      setInputValue('rollPitchKi', data.rollPitchKi, 3);
+      setInputValue('rollPitchKd', data.rollPitchKd, 3);
+      setInputValue('yawKp', data.yawKp, 3);
+      setInputValue('yawKi', data.yawKi, 3);
+      setInputValue('yawKd', data.yawKd, 3);
+      setInputValue('velocityKp', data.velocityKp, 3);
+      setInputValue('velocityKi', data.velocityKi, 3);
+      setInputValue('velocityKd', data.velocityKd, 3);
+      setInputValue('idleThrottleUs', data.idleThrottleUs, 0);
+      setInputValue('hoverThrottleUs', data.hoverThrottleUs, 0);
+      setInputValue('takeoffRampRateUsPerSec', data.takeoffRampRateUsPerSec, 0);
+      setInputValue('takeoffThrottleUs', data.takeoffThrottleUs, 0);
+    }
+
+    function pidPayload() {
+      return new URLSearchParams({
+        rollPitchKp: inputValue('rollPitchKp'),
+        rollPitchKi: inputValue('rollPitchKi'),
+        rollPitchKd: inputValue('rollPitchKd'),
+        yawKp: inputValue('yawKp'),
+        yawKi: inputValue('yawKi'),
+        yawKd: inputValue('yawKd'),
+        velocityKp: inputValue('velocityKp'),
+        velocityKi: inputValue('velocityKi'),
+        velocityKd: inputValue('velocityKd'),
+        idleThrottleUs: inputValue('idleThrottleUs'),
+        hoverThrottleUs: inputValue('hoverThrottleUs'),
+        takeoffRampRateUsPerSec: inputValue('takeoffRampRateUsPerSec'),
+        takeoffThrottleUs: inputValue('takeoffThrottleUs')
+      });
+    }
+
+    function applyPidTuning() {
+      fetch('/pid', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: pidPayload().toString()
+      })
+        .then(response => response.json())
+        .then(data => {
+          populatePidForm(data);
+          setPidStatus('PID values applied in RAM. Press SAVE to keep them after reboot.');
+        })
+        .catch(() => setPidStatus('Failed to apply PID values'));
+    }
+
+    function savePidTuning() {
+      fetch('/pid', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: pidPayload().toString()
+      })
+        .then(response => response.json())
+        .then(data => {
+          populatePidForm(data);
+          return fetch('/pid/save', { method: 'POST' });
+        })
+        .then(response => response.text())
+        .then(text => setPidStatus(text))
+        .catch(() => setPidStatus('Failed to save PID values'));
+    }
+
+    function loadPidTuning(showMessage) {
+      fetch('/pid')
+        .then(response => response.json())
+        .then(data => {
+          populatePidForm(data);
+          if (showMessage) {
+            setPidStatus('Loaded stored PID values');
+          }
+        })
+        .catch(() => setPidStatus('Failed to load PID values'));
     }
 
     function sendCommand(command) {
@@ -525,6 +1072,8 @@ namespace
     });
 
     window.addEventListener('resize', renderAll);
+    window.setInterval(scheduleControlSend, 100);
+    loadPidTuning(false);
     resetJoysticks();
   </script>
 </body>
@@ -535,6 +1084,42 @@ namespace
   void handleRoot()
   {
     server.send(200, "text/html", webpage());
+  }
+
+  void handlePidGet()
+  {
+    server.send(200, "application/json", pidSettingsJson());
+  }
+
+  void handlePidUpdate()
+  {
+    pidSettings.rollPitch.kp = clampFloat(argToFloat("rollPitchKp", pidSettings.rollPitch.kp), 0.0f, 50.0f);
+    pidSettings.rollPitch.ki = clampFloat(argToFloat("rollPitchKi", pidSettings.rollPitch.ki), 0.0f, 10.0f);
+    pidSettings.rollPitch.kd = clampFloat(argToFloat("rollPitchKd", pidSettings.rollPitch.kd), 0.0f, 10.0f);
+    pidSettings.yaw.kp = clampFloat(argToFloat("yawKp", pidSettings.yaw.kp), 0.0f, 20.0f);
+    pidSettings.yaw.ki = clampFloat(argToFloat("yawKi", pidSettings.yaw.ki), 0.0f, 10.0f);
+    pidSettings.yaw.kd = clampFloat(argToFloat("yawKd", pidSettings.yaw.kd), 0.0f, 10.0f);
+    pidSettings.velocity.kp = clampFloat(argToFloat("velocityKp", pidSettings.velocity.kp), 0.0f, 10.0f);
+    pidSettings.velocity.ki = clampFloat(argToFloat("velocityKi", pidSettings.velocity.ki), 0.0f, 10.0f);
+    pidSettings.velocity.kd = clampFloat(argToFloat("velocityKd", pidSettings.velocity.kd), 0.0f, 10.0f);
+    pidSettings.idleThrottleUs = clampFloat(argToFloat("idleThrottleUs", pidSettings.idleThrottleUs), 1000.0f, 1400.0f);
+    pidSettings.hoverThrottleUs = clampFloat(argToFloat("hoverThrottleUs", pidSettings.hoverThrottleUs), pidSettings.idleThrottleUs, 2000.0f);
+    pidSettings.takeoffRampRateUsPerSec = clampFloat(argToFloat("takeoffRampRateUsPerSec", pidSettings.takeoffRampRateUsPerSec), 1.0f, 1000.0f);
+    pidSettings.takeoffThrottleUs = clampFloat(argToFloat("takeoffThrottleUs", pidSettings.takeoffThrottleUs), pidSettings.idleThrottleUs, 2000.0f);
+
+    applyPidSettings();
+    server.send(200, "application/json", pidSettingsJson());
+  }
+
+  void handlePidSave()
+  {
+    if (!savePidSettings())
+    {
+      server.send(500, "text/plain", "Failed to save PID values");
+      return;
+    }
+
+    server.send(200, "text/plain", "PID values saved for next boot");
   }
 
   void handleControl()
@@ -557,7 +1142,8 @@ namespace
       if (type == "yaw") yaw = constrain(value, -300, 300);
     }
 
-    updateMotors();
+    lastControlMs = millis();
+    failsafeTriggered = false;
     server.send(200, "text/plain", "OK");
   }
 
@@ -581,6 +1167,8 @@ namespace
     if (action == "disarm")
     {
       killSwitchActive = false;
+      failsafeTriggered = false;
+      lastControlMs = 0;
       disarmMotors();
       server.send(200, "text/plain", "DISARMED");
       return;
@@ -588,6 +1176,7 @@ namespace
 
     if (action == "kill")
     {
+      failsafeTriggered = false;
       killMotors();
       server.send(200, "text/plain", "KILLED");
       return;
@@ -610,6 +1199,8 @@ namespace DroneController
       ledcWrite(pwmChannel[i], usToDuty(1000));
     }
 
+    loadPidSettings();
+
     delay(3000);
 
     WiFi.softAP(ssid, password);
@@ -623,6 +1214,9 @@ namespace DroneController
     server.on("/", handleRoot);
     server.on("/control", handleControl);
     server.on("/command", handleCommand);
+    server.on("/pid", HTTP_GET, handlePidGet);
+    server.on("/pid", HTTP_POST, handlePidUpdate);
+    server.on("/pid/save", HTTP_POST, handlePidSave);
 
     server.begin();
   }
@@ -630,5 +1224,17 @@ namespace DroneController
   void loop()
   {
     server.handleClient();
+    runStabilizedControlLoop();
+
+    if (isArmed && !killSwitchActive && lastControlMs != 0)
+    {
+      if ((millis() - lastControlMs) > controlTimeoutMs)
+      {
+        Serial.println("Control link timeout. Failsafe disarm.");
+        failsafeTriggered = true;
+        lastControlMs = 0;
+        disarmMotors();
+      }
+    }
   }
 }
