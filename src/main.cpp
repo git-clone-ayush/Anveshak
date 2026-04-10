@@ -8,11 +8,15 @@
 #define ISM330_I2C_ADDR 0x6B
 #define MMC5983MA_I2C_ADDR MMC5983MA_7Semi::DEFAULT_ADDRESS
 
+
+
+
 ISM330DHCX_7Semi imu;
 MMC5983MA_7Semi mag;
 
 void setup() {
   Serial.begin(115200);
+ 
   while (!Serial) {
     delay(10);
   }
