@@ -1,0 +1,24 @@
+typedef struct {
+    float alpha;
+    float output;
+} LowPassFilter;
+
+
+void LPF_Init(LowPassFilter *lpf, float alpha, float initial_value)
+{
+    lpf->alpha = alpha;
+    lpf->output = initial_value;
+}
+
+float LPF_Update(LowPassFilter *lpf, float input)
+{
+    lpf->output = lpf->output + lpf->alpha * (input - lpf->output);
+    return lpf->output;
+}
+
+float LPF_Update(LowPassFilter *lpf, float input)
+
+{
+    lpf->output = lpf->output + lpf->alpha * (input - lpf->output);
+    return lpf->output;
+}

@@ -1,0 +1,30 @@
+typedef struct
+{
+    float q;   // process noise covariance
+    float r;   // measurement noise covariance
+    float x;   // estimated value
+    float p;   // estimation error covariance
+    float k;   // kalman gain
+
+} KalmanFilter;
+
+void Kalman_Init(KalmanFilter *kf, float process_noise, float measurement_noise, float estimated_error, float initial_value)
+{
+    kf->q = process_noise;
+    kf->r = measurement_noise;
+    kf->p = estimated_error;
+    kf->x = initial_value;
+}
+
+float Kalman_Update(KalmanFilter *kf, float measurement)
+{
+    // Prediction update
+    kf->p = kf->p + kf->q;
+
+    // Measurement update
+    kf->k = kf->p / (kf->p + kf->r);
+    kf->x = kf->x + kf->k * (measurement - kf->x);
+    kf->p = (1 - kf->k) * kf->p;
+
+    return kf->x;
+}
