@@ -126,3 +126,12 @@ Notes
 - No barometer, ultrasonic, or ToF height sensor is defined yet
 - PID and filter files do not add new wiring by themselves
 - For true stable hover altitude, an additional height sensor is still recommended
+
+BMP585 Test Wiring
+------------------
+- BMP585 VIN / VCC -> ESP32 3.3V
+- BMP585 GND -> ESP32 GND
+- BMP585 SDA -> ESP32 GPIO 21
+- BMP585 SCL -> ESP32 GPIO 22
+- Common I2C addresses for BMP585 boards: `0x47` and `0x46`
+- Current BMP585 test code uses I2C and tries `0x47` first, then `0x46`

@@ -8,6 +8,8 @@
 #include "filter.h"
 #include "optical_flow_test.h"
 #include "pid_controller.h"
+#include "controller_interface.h"
+#include "bmp585_test.h"
 
 namespace
 {
@@ -366,719 +368,111 @@ namespace
               static_cast<int>(output.yawCorrection));
   }
 
+  void handleTelemetry()
+  {
+    String json = "{";
+    
+    // Get altitude from barometer if available
+    float altitude = 0.0f;
+    if (Bmp585Test::isReady())
+    {
+      Bmp585Test::Sample sample = Bmp585Test::latestSample();
+      if (sample.valid)
+      {
+        altitude = sample.altitudeM;
+      }
+    }
+    
+    json += "\"altitude\":" + String(altitude, 2) + ",";
+    json += "\"throttle\":" + String(throttle) + ",";
+    json += "\"pitch\":" + String(pitch) + ",";
+    json += "\"roll\":" + String(roll) + ",";
+    json += "\"yaw\":" + String(yaw) + ",";
+    json += "\"armed\":" + String(isArmed ? "true" : "false") + ",";
+    json += "\"failsafe\":" + String(failsafeTriggered ? "true" : "false");
+    json += "}";
+    
+    server.send(200, "application/json", json);
+  }
+
+  void handleControlPost()
+  {
+    if (server.hasHeader("Content-Type") && server.header("Content-Type") == "application/json")
+    {
+      String body = server.arg("plain");
+      
+      // Parse JSON: {"pitch": 0, "roll": 0, "throttle": 1000, "yaw": 0, "armed": 0}
+      int throttleVal = 1000, pitchVal = 0, rollVal = 0, yawVal = 0;
+      int armedVal = 0;
+      
+      if (body.indexOf("throttle") >= 0)
+      {
+        int start = body.indexOf("throttle") + 10;
+        int end = body.indexOf(",", start);
+        if (end < 0) end = body.indexOf("}", start);
+        throttleVal = constrain(body.substring(start, end).toInt() * 2 + 1000, 1000, 2000);
+      }
+      
+      if (body.indexOf("pitch") >= 0)
+      {
+        int start = body.indexOf("pitch") + 7;
+        int end = body.indexOf(",", start);
+        if (end < 0) end = body.indexOf("}", start);
+        pitchVal = constrain(body.substring(start, end).toInt(), -300, 300);
+      }
+      
+      if (body.indexOf("roll") >= 0)
+      {
+        int start = body.indexOf("roll") + 6;
+        int end = body.indexOf(",", start);
+        if (end < 0) end = body.indexOf("}", start);
+        rollVal = constrain(body.substring(start, end).toInt(), -300, 300);
+      }
+      
+      if (body.indexOf("yaw") >= 0)
+      {
+        int start = body.indexOf("yaw") + 5;
+        int end = body.indexOf(",", start);
+        if (end < 0) end = body.indexOf("}", start);
+        yawVal = constrain(body.substring(start, end).toInt(), -300, 300);
+      }
+      
+      if (body.indexOf("armed") >= 0)
+      {
+        int start = body.indexOf("armed") + 7;
+        int end = body.indexOf(",", start);
+        if (end < 0) end = body.indexOf("}", start);
+        armedVal = body.substring(start, end).toInt();
+      }
+      
+      throttle = throttleVal;
+      pitch = pitchVal;
+      roll = rollVal;
+      yaw = yawVal;
+      
+      if (armedVal && !isArmed)
+      {
+        armMotors();
+      }
+      else if (!armedVal && isArmed)
+      {
+        disarmMotors();
+      }
+      
+      lastControlMs = millis();
+      failsafeTriggered = false;
+      
+      server.send(200, "application/json", "{\"status\":\"ok\"}");
+    }
+    else
+    {
+      handleControl();
+    }
+  }
+
   String webpage()
   {
-    return R"HTML(
-<!DOCTYPE html>
-<html>
-<head>
-  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
-  <style>
-    :root {
-      --bg: #0f172a;
-      --panel-border: #334155;
-      --text: #e5e7eb;
-      --muted: #94a3b8;
-      --arm: #15803d;
-      --disarm: #475569;
-      --kill: #b91c1c;
-      --apply: #0369a1;
-      --save: #0f766e;
-      --reload: #475569;
-    }
-
-    * {
-      box-sizing: border-box;
-      -webkit-tap-highlight-color: transparent;
-    }
-
-    body {
-      margin: 0;
-      min-height: 100vh;
-      font-family: Arial, sans-serif;
-      background:
-        radial-gradient(circle at top, rgba(56, 189, 248, 0.18), transparent 28%),
-        linear-gradient(180deg, #020617 0%, #0f172a 100%);
-      color: var(--text);
-      overflow-x: hidden;
-      overflow-y: auto;
-    }
-
-    .layout {
-      display: flex;
-      flex-direction: column;
-      min-height: 100vh;
-      padding: 14px;
-      gap: 12px;
-    }
-
-    .topbar,
-    .value-panel,
-    .joystick-card,
-    .tuning-card {
-      background: rgba(15, 23, 42, 0.86);
-      border: 1px solid var(--panel-border);
-      border-radius: 18px;
-      backdrop-filter: blur(10px);
-    }
-
-    .topbar {
-      padding: 14px;
-    }
-
-    .title {
-      margin: 0 0 8px 0;
-      font-size: 24px;
-      text-align: center;
-      letter-spacing: 1px;
-    }
-
-    .status {
-      text-align: center;
-      font-weight: bold;
-      color: #f8fafc;
-      margin-bottom: 12px;
-    }
-
-    .button-row {
-      display: grid;
-      grid-template-columns: repeat(3, 1fr);
-      gap: 10px;
-    }
-
-    button {
-      border: none;
-      border-radius: 14px;
-      padding: 14px 10px;
-      color: white;
-      font-size: 15px;
-      font-weight: bold;
-      letter-spacing: 0.5px;
-      touch-action: manipulation;
-    }
-
-    .arm-btn { background: var(--arm); }
-    .disarm-btn { background: var(--disarm); }
-    .kill-btn { background: var(--kill); }
-    .apply-btn { background: var(--apply); }
-    .save-btn { background: var(--save); }
-    .reload-btn { background: var(--reload); }
-
-    .value-panel {
-      display: grid;
-      grid-template-columns: repeat(4, 1fr);
-      gap: 8px;
-      padding: 12px;
-      text-align: center;
-    }
-
-    .value-box {
-      padding: 8px 4px;
-      border-radius: 12px;
-      background: rgba(30, 41, 59, 0.72);
-    }
-
-    .value-box span {
-      display: block;
-    }
-
-    .value-label {
-      color: var(--muted);
-      font-size: 12px;
-      margin-bottom: 4px;
-      text-transform: uppercase;
-    }
-
-    .value-number {
-      font-size: 18px;
-      font-weight: bold;
-    }
-
-    .sticks {
-      flex: 1;
-      display: grid;
-      grid-template-columns: repeat(2, minmax(0, 1fr));
-      gap: 12px;
-      align-items: stretch;
-    }
-
-    .joystick-card {
-      padding: 12px;
-      display: flex;
-      flex-direction: column;
-      align-items: center;
-      justify-content: center;
-      gap: 10px;
-    }
-
-    .joystick-title {
-      font-size: 14px;
-      color: var(--muted);
-      text-transform: uppercase;
-      letter-spacing: 1px;
-    }
-
-    .joystick {
-      position: relative;
-      width: min(42vw, 260px);
-      height: min(42vw, 260px);
-      max-width: 260px;
-      max-height: 260px;
-      border-radius: 50%;
-      border: 2px solid rgba(148, 163, 184, 0.35);
-      background:
-        radial-gradient(circle, rgba(56, 189, 248, 0.12), rgba(15, 23, 42, 0.8) 62%),
-        linear-gradient(180deg, rgba(15, 23, 42, 0.95), rgba(2, 6, 23, 0.95));
-      touch-action: none;
-      overflow: hidden;
-    }
-
-    .joystick::before,
-    .joystick::after {
-      content: "";
-      position: absolute;
-      background: rgba(148, 163, 184, 0.22);
-    }
-
-    .joystick::before {
-      top: 50%;
-      left: 12%;
-      right: 12%;
-      height: 1px;
-      transform: translateY(-50%);
-    }
-
-    .joystick::after {
-      left: 50%;
-      top: 12%;
-      bottom: 12%;
-      width: 1px;
-      transform: translateX(-50%);
-    }
-
-    .knob {
-      position: absolute;
-      left: 50%;
-      top: 50%;
-      width: 34%;
-      height: 34%;
-      border-radius: 50%;
-      transform: translate(-50%, -50%);
-      background:
-        radial-gradient(circle at 30% 30%, #f8fafc, #38bdf8 38%, #0f172a 100%);
-      box-shadow: 0 0 22px rgba(56, 189, 248, 0.45);
-    }
-
-    .hint {
-      font-size: 12px;
-      color: var(--muted);
-      text-align: center;
-      line-height: 1.4;
-    }
-
-    .tuning-card {
-      padding: 14px;
-    }
-
-    .tuning-title {
-      font-size: 14px;
-      color: var(--muted);
-      text-transform: uppercase;
-      letter-spacing: 1px;
-      margin-bottom: 10px;
-    }
-
-    .tuning-note,
-    .pid-status {
-      font-size: 12px;
-      color: var(--muted);
-      line-height: 1.4;
-    }
-
-    .pid-grid {
-      display: grid;
-      grid-template-columns: repeat(2, minmax(0, 1fr));
-      gap: 12px;
-      margin-top: 12px;
-    }
-
-    .pid-group {
-      padding: 12px;
-      border-radius: 14px;
-      background: rgba(2, 6, 23, 0.35);
-      border: 1px solid rgba(148, 163, 184, 0.15);
-    }
-
-    .pid-group-title {
-      font-size: 13px;
-      margin-bottom: 10px;
-      color: #f8fafc;
-    }
-
-    .field-grid {
-      display: grid;
-      grid-template-columns: repeat(3, minmax(0, 1fr));
-      gap: 8px;
-    }
-
-    .field-grid.two {
-      grid-template-columns: repeat(2, minmax(0, 1fr));
-    }
-
-    .field {
-      display: flex;
-      flex-direction: column;
-      gap: 6px;
-    }
-
-    .field label {
-      font-size: 11px;
-      color: var(--muted);
-      text-transform: uppercase;
-      letter-spacing: 0.6px;
-    }
-
-    .field input {
-      width: 100%;
-      border-radius: 10px;
-      border: 1px solid rgba(148, 163, 184, 0.2);
-      background: rgba(15, 23, 42, 0.95);
-      color: var(--text);
-      padding: 10px;
-      font-size: 14px;
-    }
-
-    .pid-actions {
-      display: grid;
-      grid-template-columns: repeat(3, 1fr);
-      gap: 10px;
-      margin-top: 14px;
-    }
-
-    @media (max-width: 820px) {
-      .sticks,
-      .pid-grid,
-      .field-grid,
-      .field-grid.two,
-      .pid-actions,
-      .button-row {
-        grid-template-columns: 1fr;
-      }
-    }
-  </style>
-</head>
-<body>
-  <div class="layout">
-    <div class="topbar">
-      <h2 class="title">ESP32 Drone RC</h2>
-      <div class="status" id="status">DISARMED</div>
-      <div class="button-row">
-        <button class="arm-btn" onclick="sendCommand('arm')">ARM</button>
-        <button class="disarm-btn" onclick="sendCommand('disarm')">DISARM</button>
-        <button class="kill-btn" onclick="sendCommand('kill')">KILL SWITCH</button>
-      </div>
-    </div>
-
-    <div class="value-panel">
-      <div class="value-box">
-        <span class="value-label">Throttle</span>
-        <span class="value-number" id="throttleValue">1000</span>
-      </div>
-      <div class="value-box">
-        <span class="value-label">Yaw</span>
-        <span class="value-number" id="yawValue">0</span>
-      </div>
-      <div class="value-box">
-        <span class="value-label">Pitch</span>
-        <span class="value-number" id="pitchValue">0</span>
-      </div>
-      <div class="value-box">
-        <span class="value-label">Roll</span>
-        <span class="value-number" id="rollValue">0</span>
-      </div>
-    </div>
-
-    <div class="sticks">
-      <div class="joystick-card">
-        <div class="joystick-title">Left Stick</div>
-        <div class="joystick" id="leftPad">
-          <div class="knob" id="leftKnob"></div>
-        </div>
-        <div class="hint">Throttle stays where you leave it. Yaw returns to center.</div>
-      </div>
-
-      <div class="joystick-card">
-        <div class="joystick-title">Right Stick</div>
-        <div class="joystick" id="rightPad">
-          <div class="knob" id="rightKnob"></div>
-        </div>
-        <div class="hint">Pitch and roll return to center when released.</div>
-      </div>
-    </div>
-
-    <div class="tuning-card">
-      <div class="tuning-title">PID And Takeoff Tuning</div>
-      <div class="tuning-note">Assumed frame setup: optical flow sensor facing downward, MPU X-axis facing forward. Roll tuning is left/right stabilization. Pitch tuning is forward/back stabilization. Verify axis signs with props removed before flight.</div>
-
-      <div class="pid-grid">
-        <div class="pid-group">
-          <div class="pid-group-title">Roll / Pitch</div>
-          <div class="field-grid">
-            <div class="field">
-              <label for="rollPitchKp">KP</label>
-              <input id="rollPitchKp" type="number" step="0.01">
-            </div>
-            <div class="field">
-              <label for="rollPitchKi">KI</label>
-              <input id="rollPitchKi" type="number" step="0.01">
-            </div>
-            <div class="field">
-              <label for="rollPitchKd">KD</label>
-              <input id="rollPitchKd" type="number" step="0.01">
-            </div>
-          </div>
-        </div>
-
-        <div class="pid-group">
-          <div class="pid-group-title">Yaw</div>
-          <div class="field-grid">
-            <div class="field">
-              <label for="yawKp">KP</label>
-              <input id="yawKp" type="number" step="0.01">
-            </div>
-            <div class="field">
-              <label for="yawKi">KI</label>
-              <input id="yawKi" type="number" step="0.01">
-            </div>
-            <div class="field">
-              <label for="yawKd">KD</label>
-              <input id="yawKd" type="number" step="0.01">
-            </div>
-          </div>
-        </div>
-
-        <div class="pid-group">
-          <div class="pid-group-title">Optical Flow Velocity</div>
-          <div class="field-grid">
-            <div class="field">
-              <label for="velocityKp">KP</label>
-              <input id="velocityKp" type="number" step="0.01">
-            </div>
-            <div class="field">
-              <label for="velocityKi">KI</label>
-              <input id="velocityKi" type="number" step="0.01">
-            </div>
-            <div class="field">
-              <label for="velocityKd">KD</label>
-              <input id="velocityKd" type="number" step="0.01">
-            </div>
-          </div>
-        </div>
-
-        <div class="pid-group">
-          <div class="pid-group-title">Throttle / Takeoff</div>
-          <div class="field-grid two">
-            <div class="field">
-              <label for="idleThrottleUs">Idle (us)</label>
-              <input id="idleThrottleUs" type="number" step="1">
-            </div>
-            <div class="field">
-              <label for="hoverThrottleUs">Hover (us)</label>
-              <input id="hoverThrottleUs" type="number" step="1">
-            </div>
-            <div class="field">
-              <label for="takeoffRampRateUsPerSec">Ramp (us/s)</label>
-              <input id="takeoffRampRateUsPerSec" type="number" step="1">
-            </div>
-            <div class="field">
-              <label for="takeoffThrottleUs">Takeoff Target (us)</label>
-              <input id="takeoffThrottleUs" type="number" step="1">
-            </div>
-          </div>
-        </div>
-      </div>
-
-      <div class="pid-actions">
-        <button class="apply-btn" onclick="applyPidTuning()">APPLY</button>
-        <button class="save-btn" onclick="savePidTuning()">SAVE</button>
-        <button class="reload-btn" onclick="loadPidTuning(true)">RELOAD</button>
-      </div>
-      <div class="pid-status" id="pidStatus">Stored values load automatically on boot.</div>
-    </div>
-  </div>
-
-  <script>
-    const leftState = { x: 0, y: 1 };
-    const rightState = { x: 0, y: 0 };
-    let requestInFlight = false;
-    let resendNeeded = false;
-
-    function clamp(value, min, max) {
-      return Math.min(max, Math.max(min, value));
-    }
-
-    function normalize(value) {
-      return Math.round(value * 1000) / 1000;
-    }
-
-    function getControlValues() {
-      return {
-        throttle: clamp(Math.round(1000 + ((1 - leftState.y) * 500)), 1000, 2000),
-        yaw: clamp(Math.round(leftState.x * 300), -300, 300),
-        pitch: clamp(Math.round(-rightState.y * 300), -300, 300),
-        roll: clamp(Math.round(rightState.x * 300), -300, 300)
-      };
-    }
-
-    function updateReadout() {
-      const controls = getControlValues();
-      document.getElementById('throttleValue').innerText = controls.throttle;
-      document.getElementById('yawValue').innerText = controls.yaw;
-      document.getElementById('pitchValue').innerText = controls.pitch;
-      document.getElementById('rollValue').innerText = controls.roll;
-    }
-
-    function renderStick(padId, knobId, state) {
-      const pad = document.getElementById(padId);
-      const knob = document.getElementById(knobId);
-      const radius = (pad.clientWidth - knob.clientWidth) / 2;
-      const translateX = state.x * radius;
-      const translateY = state.y * radius;
-      knob.style.transform = 'translate(calc(-50% + ' + translateX + 'px), calc(-50% + ' + translateY + 'px))';
-    }
-
-    function scheduleControlSend() {
-      if (requestInFlight) {
-        resendNeeded = true;
-        return;
-      }
-
-      const controls = getControlValues();
-      requestInFlight = true;
-      fetch('/control?throttle=' + controls.throttle + '&pitch=' + controls.pitch + '&roll=' + controls.roll + '&yaw=' + controls.yaw)
-        .catch(() => {})
-        .finally(() => {
-          requestInFlight = false;
-          if (resendNeeded) {
-            resendNeeded = false;
-            scheduleControlSend();
-          }
-        });
-    }
-
-    function renderAll() {
-      renderStick('leftPad', 'leftKnob', leftState);
-      renderStick('rightPad', 'rightKnob', rightState);
-      updateReadout();
-      scheduleControlSend();
-    }
-
-    function resetJoysticks() {
-      leftState.x = 0;
-      leftState.y = 1;
-      rightState.x = 0;
-      rightState.y = 0;
-      renderAll();
-    }
-
-    function setStatus(text) {
-      document.getElementById('status').innerText = text;
-    }
-
-    function setPidStatus(text) {
-      document.getElementById('pidStatus').innerText = text;
-    }
-
-    function inputValue(id) {
-      return Number(document.getElementById(id).value);
-    }
-
-    function setInputValue(id, value, decimals) {
-      document.getElementById(id).value = Number(value).toFixed(decimals);
-    }
-
-    function populatePidForm(data) {
-      setInputValue('rollPitchKp', data.rollPitchKp, 3);
-      setInputValue('rollPitchKi', data.rollPitchKi, 3);
-      setInputValue('rollPitchKd', data.rollPitchKd, 3);
-      setInputValue('yawKp', data.yawKp, 3);
-      setInputValue('yawKi', data.yawKi, 3);
-      setInputValue('yawKd', data.yawKd, 3);
-      setInputValue('velocityKp', data.velocityKp, 3);
-      setInputValue('velocityKi', data.velocityKi, 3);
-      setInputValue('velocityKd', data.velocityKd, 3);
-      setInputValue('idleThrottleUs', data.idleThrottleUs, 0);
-      setInputValue('hoverThrottleUs', data.hoverThrottleUs, 0);
-      setInputValue('takeoffRampRateUsPerSec', data.takeoffRampRateUsPerSec, 0);
-      setInputValue('takeoffThrottleUs', data.takeoffThrottleUs, 0);
-    }
-
-    function pidPayload() {
-      return new URLSearchParams({
-        rollPitchKp: inputValue('rollPitchKp'),
-        rollPitchKi: inputValue('rollPitchKi'),
-        rollPitchKd: inputValue('rollPitchKd'),
-        yawKp: inputValue('yawKp'),
-        yawKi: inputValue('yawKi'),
-        yawKd: inputValue('yawKd'),
-        velocityKp: inputValue('velocityKp'),
-        velocityKi: inputValue('velocityKi'),
-        velocityKd: inputValue('velocityKd'),
-        idleThrottleUs: inputValue('idleThrottleUs'),
-        hoverThrottleUs: inputValue('hoverThrottleUs'),
-        takeoffRampRateUsPerSec: inputValue('takeoffRampRateUsPerSec'),
-        takeoffThrottleUs: inputValue('takeoffThrottleUs')
-      });
-    }
-
-    function applyPidTuning() {
-      fetch('/pid', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        body: pidPayload().toString()
-      })
-        .then(response => response.json())
-        .then(data => {
-          populatePidForm(data);
-          setPidStatus('PID values applied in RAM. Press SAVE to keep them after reboot.');
-        })
-        .catch(() => setPidStatus('Failed to apply PID values'));
-    }
-
-    function savePidTuning() {
-      fetch('/pid', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        body: pidPayload().toString()
-      })
-        .then(response => response.json())
-        .then(data => {
-          populatePidForm(data);
-          return fetch('/pid/save', { method: 'POST' });
-        })
-        .then(response => response.text())
-        .then(text => setPidStatus(text))
-        .catch(() => setPidStatus('Failed to save PID values'));
-    }
-
-    function loadPidTuning(showMessage) {
-      fetch('/pid')
-        .then(response => response.json())
-        .then(data => {
-          populatePidForm(data);
-          if (showMessage) {
-            setPidStatus('Loaded stored PID values');
-          }
-        })
-        .catch(() => setPidStatus('Failed to load PID values'));
-    }
-
-    function sendCommand(command) {
-      fetch('/command?action=' + command)
-        .then(response => response.text().then(text => ({ ok: response.ok, text: text })))
-        .then(result => {
-          if (command === 'arm' && result.ok && result.text === 'ARMED') {
-            setStatus('ARMED');
-            return;
-          }
-
-          if (command === 'disarm' && result.ok && result.text === 'DISARMED') {
-            resetJoysticks();
-            setStatus('DISARMED');
-            return;
-          }
-
-          if (command === 'kill' && result.ok && result.text === 'KILLED') {
-            resetJoysticks();
-            setStatus('KILL SWITCH ACTIVE');
-            return;
-          }
-
-          setStatus(result.text);
-        })
-        .catch(() => setStatus('Connection error'));
-    }
-
-    function attachJoystick(config) {
-      const pad = document.getElementById(config.padId);
-      let activePointerId = null;
-
-      function updateFromPointer(clientX, clientY) {
-        const rect = pad.getBoundingClientRect();
-        const centerX = rect.left + rect.width / 2;
-        const centerY = rect.top + rect.height / 2;
-        const radius = rect.width / 2;
-        let dx = (clientX - centerX) / radius;
-        let dy = (clientY - centerY) / radius;
-        const magnitude = Math.sqrt((dx * dx) + (dy * dy));
-
-        if (magnitude > 1) {
-          dx /= magnitude;
-          dy /= magnitude;
-        }
-
-        config.state.x = normalize(dx);
-        config.state.y = normalize(dy);
-        renderAll();
-      }
-
-      pad.addEventListener('pointerdown', event => {
-        if (activePointerId !== null) {
-          return;
-        }
-
-        activePointerId = event.pointerId;
-        pad.setPointerCapture(event.pointerId);
-        updateFromPointer(event.clientX, event.clientY);
-      });
-
-      pad.addEventListener('pointermove', event => {
-        if (event.pointerId !== activePointerId) {
-          return;
-        }
-
-        updateFromPointer(event.clientX, event.clientY);
-      });
-
-      function releasePointer(event) {
-        if (event.pointerId != activePointerId) {
-          return;
-        }
-
-        activePointerId = null;
-        config.onRelease();
-        renderAll();
-      }
-
-      pad.addEventListener('pointerup', releasePointer);
-      pad.addEventListener('pointercancel', releasePointer);
-    }
-
-    attachJoystick({
-      padId: 'leftPad',
-      state: leftState,
-      onRelease: () => {
-        leftState.x = 0;
-      }
-    });
-
-    attachJoystick({
-      padId: 'rightPad',
-      state: rightState,
-      onRelease: () => {
-        rightState.x = 0;
-        rightState.y = 0;
-      }
-    });
-
-    window.addEventListener('resize', renderAll);
-    window.setInterval(scheduleControlSend, 100);
-    loadPidTuning(false);
-    resetJoysticks();
-  </script>
-</body>
-</html>
-)HTML";
+    return String(HTML_INTERFACE);
   }
 
   void handleRoot()
@@ -1212,7 +606,9 @@ namespace DroneController
     Serial.println(WiFi.softAPIP());
 
     server.on("/", handleRoot);
-    server.on("/control", handleControl);
+    server.on("/control", HTTP_GET, handleControl);
+    server.on("/control", HTTP_POST, handleControlPost);
+    server.on("/telemetry", handleTelemetry);
     server.on("/command", handleCommand);
     server.on("/pid", HTTP_GET, handlePidGet);
     server.on("/pid", HTTP_POST, handlePidUpdate);
